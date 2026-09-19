@@ -4,3 +4,4 @@ cookies.txt
 .venv/
 __pycache__/
 *.pyc
+channels.json

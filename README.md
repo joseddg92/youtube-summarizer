@@ -1,9 +1,10 @@
 # youtube-summaricer
 
-Vigila un canal de YouTube, descarga los subtítulos de cada vídeo nuevo con **yt-dlp**,
-los resume con la **Inference API de Hetzner** (compatible con OpenAI) y te manda el
-resumen + enlace por **Telegram**. También puedes enviarle al bot cualquier URL de YouTube
-y te la resume al momento, editando un mensaje de progreso mientras trabaja.
+Vigila uno o varios canales de YouTube, descarga los subtítulos de cada vídeo nuevo con
+**yt-dlp**, los resume con la **Inference API de Hetzner** (compatible con OpenAI) y te manda
+el resumen + enlace por **Telegram**. También puedes enviarle al bot cualquier URL de YouTube
+y te la resume al momento, editando un mensaje de progreso mientras trabaja. Cada canal puede
+tener su propio estilo de resumen (por ejemplo, "enfocado a un trader"), gestionable desde Telegram.
 
 ## Instalación
 
@@ -19,7 +20,7 @@ cp .env.example .env   # y rellena las claves
 |---|---|
 | `HETZNER_INFERENCE_API_KEY` | Token creado en https://experiments.hetzner.com/ |
 | `HETZNER_INFERENCE_MODEL` | `Qwen/Qwen3.6-35B-A3B-FP8` (por defecto) o `Qwen3.8-27B` |
-| `YOUTUBE_CHANNEL_ID` | URL, `@handle` o ID `UC…` del canal (ej. `https://www.youtube.com/@MeetKevin`) |
+| `YOUTUBE_CHANNEL_ID` | Canal inicial (URL, `@handle` o ID `UC…`). Solo se usa para crear `channels.json` la primera vez |
 | `TELEGRAM_BOT_API_KEY` | Token que te da [@BotFather](https://t.me/BotFather) |
 | `TELEGRAM_CHAT_ID` | Chat destino. Escribe algo a tu bot y ejecuta `python main.py --get-chat-id` |
 | `YTDLP_COOKIES_FROM_BROWSER` | Opcional. Solo si YouTube devuelve *"Sign in to confirm you're not a bot"* (pasa tras muchas peticiones seguidas o desde IPs de datacenter): navegador del que leer cookies (`firefox`, `chrome`, `safari`, `brave`…) |
@@ -37,7 +38,31 @@ python main.py --video <URL>     # prueba con un vídeo concreto
 ```
 
 En modo bot, cualquier mensaje con URLs de YouTube que envíes al chat configurado
-(`TELEGRAM_CHAT_ID`) se resume al instante; mensajes de otros chats se ignoran.
+(`TELEGRAM_CHAT_ID`) se resume al instante; mensajes de otros chats se ignoran. Si acompañas
+la URL con texto ("…/watch?v=xxx céntrate en lo que dice de NVIDIA"), ese texto se usa como
+instrucciones puntuales para ese resumen.
+
+## Canales y estilos de resumen
+
+Los canales vigilados y su prompt viven en `channels.json` (ver
+[channels.example.json](channels.example.json)). Se gestionan desde Telegram:
+
+| Comando | Qué hace |
+|---|---|
+| `/channels` | Lista los canales y si tienen prompt propio |
+| `/add <url o @handle>` | Vigila un canal nuevo |
+| `/remove <canal>` | Deja de vigilarlo |
+| `/prompt <canal>` | Muestra el prompt del canal |
+| `/prompt <canal> <texto>` | Fija el prompt del canal (el texto puede ir en la línea siguiente) |
+| `/prompt <canal> reset` | Vuelve al prompt por defecto |
+| `/default [texto \| reset]` | Muestra / cambia / restaura el prompt por defecto |
+
+`<canal>` puede ser el número que sale en `/channels`, el `@handle` o parte del nombre.
+
+El prompt de un canal se aplica tanto a los vídeos nuevos detectados como a cualquier URL suya
+que envíes a mano (se identifica por el `channel_id` del vídeo). El prompt describe solo el
+enfoque y la estructura; el idioma, el formato de texto plano y la fidelidad al contenido se
+imponen siempre.
 
 En la primera ejecución solo se resumen los `FIRST_RUN_VIDEOS` vídeos más recientes; el
 resto se marcan como vistos en `state.json` para no inundar el chat.

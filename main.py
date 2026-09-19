@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Vigila un canal de YouTube, descarga los subtítulos de los vídeos nuevos (vía yt-dlp),
-los resume con la Inference API de Hetzner (compatible con OpenAI) y envía el resumen
-junto con el enlace por Telegram. Además, escucha el bot de Telegram: cualquier URL de
-YouTube que le envíes se resume al momento.
+Vigila uno o varios canales de YouTube, descarga los subtítulos de los vídeos nuevos (vía yt-dlp),
+los resume con la Inference API de Hetzner (compatible con OpenAI) y envía el resumen junto con
+el enlace por Telegram. Además escucha el bot de Telegram: cualquier URL de YouTube que le envíes
+se resume al momento, y desde el propio chat puedes gestionar los canales y el estilo de resumen
+de cada uno (/help).
 
 Uso:
-    python main.py                # bucle: escucha Telegram y comprueba el canal cada POLL_INTERVAL_MINUTES
-    python main.py --once         # una sola pasada por el canal (ideal para cron; no escucha Telegram)
+    python main.py                # bucle: escucha Telegram y comprueba los canales cada POLL_INTERVAL_MINUTES
+    python main.py --once         # una sola pasada por los canales (ideal para cron; no escucha Telegram)
     python main.py --get-chat-id  # ayuda para obtener TELEGRAM_CHAT_ID
     python main.py --video URL    # resume un vídeo concreto (ignora el estado)
 """
@@ -45,7 +46,7 @@ CONFIG = {
     "hetzner_api_key": env("HETZNER_INFERENCE_API_KEY"),
     "hetzner_base_url": env("HETZNER_INFERENCE_BASE_URL", "https://inference.hetzner.com/api/v1"),
     "hetzner_model": env("HETZNER_INFERENCE_MODEL", "Qwen/Qwen3.6-35B-A3B-FP8"),
-    "channel": env("YOUTUBE_CHANNEL_ID"),
+    "seed_channel": env("YOUTUBE_CHANNEL_ID"),
     "subtitle_langs": [l.strip() for l in env("SUBTITLE_LANGUAGES", "en,es").split(",") if l.strip()],
     "check_latest_n": int(env("CHECK_LATEST_N", "10")),
     "max_per_run": int(env("MAX_VIDEOS_PER_RUN", "3")),
@@ -58,6 +59,7 @@ CONFIG = {
     "summary_language": env("SUMMARY_LANGUAGE", "español"),
     "poll_minutes": float(env("POLL_INTERVAL_MINUTES", "30")),
     "state_file": Path(env("STATE_FILE", "state.json")),
+    "channels_file": Path(env("CHANNELS_FILE", "channels.json")),
 }
 
 # Límite de seguridad para la transcripción (~100k tokens; el modelo admite 262k)
@@ -71,26 +73,60 @@ YOUTUBE_URL_RE = re.compile(
     r"([\w-]{11})"
 )
 
-# --------------------------------------------------------------------------- estado
+DEFAULT_INSTRUCTIONS = (
+    "1. Un párrafo de 2-3 frases con la idea principal.\n"
+    "2. 'Puntos clave:' seguido de 4-8 viñetas concretas (datos, cifras, argumentos, recomendaciones).\n"
+    "3. 'Conclusión:' una frase con la postura o recomendación final del autor.\n"
+    "Máximo ~300 palabras."
+)
+
+# --------------------------------------------------------------------------- ficheros JSON
 
 
-def load_state(path: Path) -> dict:
+def load_json(path: Path, default: dict) -> dict:
     if path.exists():
         with path.open(encoding="utf-8") as fh:
-            state = json.load(fh)
+            data = json.load(fh)
     else:
-        state = {}
-    state.setdefault("processed", {})  # video_id -> info
-    state.setdefault("pending", {})    # video_id -> primera vez visto (ISO)
-    state.setdefault("telegram_offset", 0)
-    return state
+        data = {}
+    for key, value in default.items():
+        data.setdefault(key, json.loads(json.dumps(value)))
+    return data
 
 
-def save_state(path: Path, state: dict) -> None:
+def save_json(path: Path, data: dict) -> None:
     tmp = path.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(state, fh, ensure_ascii=False, indent=2)
+        json.dump(data, fh, ensure_ascii=False, indent=2)
     tmp.replace(path)
+
+
+STATE_DEFAULT = {
+    "processed": {},            # video_id -> info
+    "pending": {},              # video_id -> primera vez visto (ISO)
+    "initialized_channels": [],  # channel_ids cuyo histórico ya se marcó como visto
+    "telegram_offset": 0,
+}
+CHANNELS_DEFAULT = {
+    "default_prompt": None,  # si es None se usa DEFAULT_INSTRUCTIONS
+    "channels": {},          # channel_id -> {name, handle, url, prompt}
+}
+
+
+def load_state() -> dict:
+    return load_json(CONFIG["state_file"], STATE_DEFAULT)
+
+
+def save_state(state: dict) -> None:
+    save_json(CONFIG["state_file"], state)
+
+
+def load_channels() -> dict:
+    return load_json(CONFIG["channels_file"], CHANNELS_DEFAULT)
+
+
+def save_channels(channels: dict) -> None:
+    save_json(CONFIG["channels_file"], channels)
 
 
 # --------------------------------------------------------------------------- youtube
@@ -143,8 +179,11 @@ def ydl_base_opts() -> dict:
     return opts
 
 
-def list_latest_videos(channel_url: str, limit: int) -> list[dict]:
-    """Devuelve los últimos `limit` vídeos del canal (más recientes primero) sin descargar nada."""
+def fetch_channel(channel_url: str, limit: int) -> tuple[dict, list[dict]]:
+    """
+    Devuelve (info del canal, últimos `limit` vídeos más recientes primero) sin descargar nada.
+    info contiene channel_id, channel (nombre) y uploader_id (@handle).
+    """
     opts = ydl_base_opts() | {"extract_flat": "in_playlist", "playlistend": limit}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(channel_url, download=False)
@@ -154,7 +193,22 @@ def list_latest_videos(channel_url: str, limit: int) -> list[dict]:
         if not vid:
             continue
         videos.append({"id": vid, "title": entry.get("title") or vid, "url": video_url(vid)})
-    return videos
+    return info, videos
+
+
+def resolve_channel(ref: str) -> dict:
+    """Convierte una URL/@handle/ID en un registro de canal {id, name, handle, url}."""
+    info, _ = fetch_channel(normalize_channel_url(ref), 1)
+    channel_id = info.get("channel_id") or info.get("id")
+    if not channel_id or not channel_id.startswith("UC"):
+        raise ValueError(f"No parece un canal de YouTube: {ref}")
+    handle = info.get("uploader_id") or ""
+    return {
+        "id": channel_id,
+        "name": info.get("channel") or info.get("uploader") or handle or channel_id,
+        "handle": handle if handle.startswith("@") else "",
+        "url": f"https://www.youtube.com/{handle}" if handle.startswith("@") else f"https://www.youtube.com/channel/{channel_id}",
+    }
 
 
 def parse_json3(raw: bytes) -> str:
@@ -214,7 +268,22 @@ def clean_summary(text: str) -> str:
     return text.strip()
 
 
-def summarize(transcript: str, title: str, channel: str, duration_min: float | None) -> str:
+def instructions_for(channel_id: str | None, channels: dict, extra: str | None = None) -> tuple[str, str]:
+    """Devuelve (instrucciones, etiqueta descriptiva) para un vídeo según su canal y las instrucciones puntuales."""
+    entry = channels["channels"].get(channel_id or "", {})
+    if entry.get("prompt"):
+        instructions, label = entry["prompt"], f"prompt de {entry.get('name') or channel_id}"
+    elif channels.get("default_prompt"):
+        instructions, label = channels["default_prompt"], "prompt por defecto (personalizado)"
+    else:
+        instructions, label = DEFAULT_INSTRUCTIONS, "prompt por defecto"
+    if extra:
+        instructions = f"{instructions}\n\nInstrucciones adicionales para este vídeo en concreto (tienen prioridad):\n{extra}"
+        label += " + instrucciones del mensaje"
+    return instructions, label
+
+
+def summarize(transcript: str, title: str, channel: str, duration_min: float | None, instructions: str) -> str:
     if len(transcript) > MAX_TRANSCRIPT_CHARS:
         log.warning("Transcripción muy larga (%d chars), se recorta", len(transcript))
         transcript = transcript[:MAX_TRANSCRIPT_CHARS]
@@ -225,12 +294,9 @@ def summarize(transcript: str, title: str, channel: str, duration_min: float | N
         f"Eres un asistente que resume vídeos de YouTube a partir de su transcripción. "
         f"Responde siempre en {CONFIG['summary_language']}. "
         "El resultado se enviará por Telegram como texto plano: NO uses Markdown "
-        "(nada de **, #, ``` ni tablas). Usa el guion '-' para las listas.\n\n"
-        "Estructura:\n"
-        "1. Un párrafo de 2-3 frases con la idea principal.\n"
-        "2. 'Puntos clave:' seguido de 4-8 viñetas concretas (datos, cifras, argumentos, recomendaciones).\n"
-        "3. 'Conclusión:' una frase con la postura o recomendación final del autor.\n"
-        "Sé fiel al contenido, no inventes nada y no añadas opiniones propias. Máximo ~300 palabras."
+        "(nada de **, #, ``` ni tablas). Usa el guion '-' para las listas. "
+        "Sé fiel al contenido, no inventes nada y no añadas opiniones propias.\n\n"
+        f"Instrucciones sobre el enfoque y la estructura del resumen:\n{instructions}"
     )
     meta = f"Canal: {channel}\nTítulo: {title}"
     if duration_min:
@@ -244,7 +310,7 @@ def summarize(transcript: str, title: str, channel: str, duration_min: float | N
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.3,
-        max_tokens=1500,
+        max_tokens=2000,
         # Qwen3 es un modelo "thinking": sin esto gasta todos los tokens razonando y devuelve content vacío
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
@@ -309,14 +375,14 @@ class ProgressMessage:
     def _header(self) -> str:
         return f"🎬 {self.title}\n{self.url}" if self.title else f"🎬 {self.url}"
 
-    def _render(self, chat_id, text: str, preview: bool) -> None:
+    def _render(self, text: str, preview: bool) -> None:
         options = {"is_disabled": not preview, "prefer_small_media": True}
         if self.message_id is None:
-            result = telegram_api("sendMessage", chat_id=chat_id, text=text, link_preview_options=options)
+            result = telegram_api("sendMessage", chat_id=self.chat_id, text=text, link_preview_options=options)
             self.message_id = result["message_id"]
             return
         try:
-            telegram_api("editMessageText", chat_id=chat_id, message_id=self.message_id,
+            telegram_api("editMessageText", chat_id=self.chat_id, message_id=self.message_id,
                          text=text, link_preview_options=options)
         except RuntimeError as exc:
             if "message is not modified" not in str(exc):
@@ -324,16 +390,16 @@ class ProgressMessage:
 
     def update(self, status: str) -> None:
         # Sin previsualización mientras trabaja, para que el mensaje se vea compacto
-        self._render(self.chat_id, f"{self._header()}\n\n⏳ {status}", preview=False)
+        self._render(f"{self._header()}\n\n⏳ {status}", preview=False)
 
     def finish(self, summary: str) -> None:
         chunks = split_message(f"{self._header()}\n\n{summary}")
-        self._render(self.chat_id, chunks[0], preview=True)
+        self._render(chunks[0], preview=True)
         for chunk in chunks[1:]:
             send_message(self.chat_id, chunk, preview=False)
 
     def fail(self, reason: str) -> None:
-        self._render(self.chat_id, f"{self._header()}\n\n❌ {reason}", preview=False)
+        self._render(f"{self._header()}\n\n❌ {reason}", preview=False)
 
 
 def print_chat_ids() -> None:
@@ -355,7 +421,7 @@ def print_chat_ids() -> None:
 # --------------------------------------------------------------------------- flujo principal
 
 
-def process_video(video: dict, channel_name: str, chat_id: str | int, eager: bool) -> bool:
+def process_video(video: dict, chat_id: str | int, eager: bool, extra_instructions: str | None = None) -> bool:
     """
     Descarga subtítulos, resume y envía. Devuelve True si se completó, False si aún no hay subtítulos.
 
@@ -388,13 +454,16 @@ def process_video(video: dict, channel_name: str, chat_id: str | int, eager: boo
             progress.fail("El vídeo no tiene subtítulos disponibles (aún).")
         return False
 
+    channel_name = info.get("channel") or info.get("uploader") or ""
+    instructions, label = instructions_for(info.get("channel_id"), load_channels(), extra_instructions)
     duration_min = (info.get("duration") or 0) / 60 or None
-    log.info("Transcripción obtenida (%s, %d chars). Resumiendo con %s…", source, len(transcript), CONFIG["hetzner_model"])
+    log.info("Transcripción obtenida (%s, %d chars). Resumiendo con %s usando %s…",
+             source, len(transcript), CONFIG["hetzner_model"], label)
     details = f"{duration_min:.0f} min, " if duration_min else ""
-    progress.update(f"Resumiendo ({details}{len(transcript) // 1000}k caracteres de transcripción)…")
+    progress.update(f"Resumiendo ({details}{len(transcript) // 1000}k caracteres, {label})…")
 
     try:
-        summary = summarize(transcript, progress.title, info.get("channel") or channel_name, duration_min)
+        summary = summarize(transcript, progress.title, channel_name, duration_min, instructions)
     except Exception as exc:  # noqa: BLE001
         progress.fail(f"Error al resumir: {str(exc)[:200]}")
         raise
@@ -404,25 +473,20 @@ def process_video(video: dict, channel_name: str, chat_id: str | int, eager: boo
     return True
 
 
-def check_channel() -> None:
-    """Una pasada por el canal: resume los vídeos nuevos."""
-    channel_url = normalize_channel_url(CONFIG["channel"])
-    state = load_state(CONFIG["state_file"])
-    first_run = not state["processed"]
-
-    videos = list_latest_videos(channel_url, CONFIG["check_latest_n"])
+def check_one_channel(channel: dict, state: dict, now: datetime) -> int:
+    """Una pasada por un canal. Devuelve el nº de vídeos resumidos."""
+    _, videos = fetch_channel(normalize_channel_url(channel["url"]), CONFIG["check_latest_n"])
     if not videos:
-        log.warning("No se encontraron vídeos en %s", channel_url)
-        return
-    log.info("%d vídeos recientes en el canal; %d ya procesados", len(videos), len(state["processed"]))
+        log.warning("No se encontraron vídeos en %s", channel["url"])
+        return 0
+    log.info("[%s] %d vídeos recientes", channel["name"], len(videos))
 
-    now = datetime.now(timezone.utc)
-
-    if first_run:
-        # Marcamos como vistos todos menos los N más recientes para no reventar el chat con vídeos antiguos
+    if channel["id"] not in state["initialized_channels"]:
+        # Canal nuevo: marcamos como vistos todos menos los N más recientes para no reventar el chat
         for v in videos[CONFIG["first_run_videos"]:]:
-            state["processed"][v["id"]] = {"title": v["title"], "skipped_on_first_run": True, "at": now.isoformat()}
-        save_state(CONFIG["state_file"], state)
+            state["processed"].setdefault(v["id"], {"title": v["title"], "skipped_on_first_run": True, "at": now.isoformat()})
+        state["initialized_channels"].append(channel["id"])
+        save_state(state)
 
     new_videos = [v for v in videos if v["id"] not in state["processed"]]
     # Los más antiguos primero, para que lleguen por Telegram en orden cronológico
@@ -431,7 +495,7 @@ def check_channel() -> None:
     done = 0
     for video in new_videos:
         if done >= CONFIG["max_per_run"]:
-            log.info("Alcanzado MAX_VIDEOS_PER_RUN, el resto quedará para la siguiente pasada")
+            log.info("[%s] Alcanzado MAX_VIDEOS_PER_RUN, el resto quedará para la siguiente pasada", channel["name"])
             break
 
         first_seen = state["pending"].get(video["id"])
@@ -441,37 +505,193 @@ def check_channel() -> None:
                 log.warning("Descartando %s: sin subtítulos tras %.0f h", video["id"], age.total_seconds() / 3600)
                 state["processed"][video["id"]] = {"title": video["title"], "gave_up": True, "at": now.isoformat()}
                 state["pending"].pop(video["id"], None)
-                save_state(CONFIG["state_file"], state)
+                save_state(state)
                 continue
 
         try:
-            ok = process_video(video, CONFIG["channel"], CONFIG["telegram_chat_id"], eager=False)
+            ok = process_video(video, CONFIG["telegram_chat_id"], eager=False)
         except Exception:  # noqa: BLE001
             log.exception("Error procesando %s; se reintentará en la siguiente pasada", video["id"])
             continue
 
-        # Recargamos por si handle_telegram_updates ha tocado el fichero mientras tanto
-        state = load_state(CONFIG["state_file"])
         if ok:
-            state["processed"][video["id"]] = {"title": video["title"], "at": now.isoformat()}
+            state["processed"][video["id"]] = {"title": video["title"], "channel": channel["name"], "at": now.isoformat()}
             state["pending"].pop(video["id"], None)
             done += 1
         else:
             state["pending"].setdefault(video["id"], now.isoformat())
-        save_state(CONFIG["state_file"], state)
+        save_state(state)
+    return done
 
-    log.info("Pasada terminada: %d vídeo(s) resumido(s)", done)
+
+def check_channels() -> None:
+    """Una pasada por todos los canales configurados."""
+    channels = load_channels()
+    if not channels["channels"]:
+        log.warning("No hay canales configurados (usa /add en Telegram o YOUTUBE_CHANNEL_ID en .env)")
+        return
+    state = load_state()
+    now = datetime.now(timezone.utc)
+    total = 0
+    for channel in channels["channels"].values():
+        try:
+            total += check_one_channel(channel, state, now)
+        except Exception:  # noqa: BLE001
+            log.exception("Error comprobando el canal %s", channel.get("name"))
+    log.info("Pasada terminada: %d vídeo(s) resumido(s)", total)
 
 
-HELP_TEXT = (
-    "Envíame una o varias URLs de YouTube y te devuelvo un resumen del vídeo.\n"
-    "Además vigilo el canal configurado y te aviso de los vídeos nuevos."
-)
+def seed_channels_from_env() -> None:
+    """Primera ejecución: si channels.json no existe, lo creamos con el canal del .env."""
+    if CONFIG["channels_file"].exists() or not CONFIG["seed_channel"]:
+        return
+    log.info("Creando %s a partir de YOUTUBE_CHANNEL_ID=%s", CONFIG["channels_file"], CONFIG["seed_channel"])
+    channels = load_channels()
+    channel = resolve_channel(CONFIG["seed_channel"])
+    channels["channels"][channel["id"]] = channel | {"prompt": None}
+    save_channels(channels)
+
+
+# --------------------------------------------------------------------------- comandos de Telegram
+
+HELP_TEXT = """Envíame una o varias URLs de YouTube y te devuelvo un resumen. Si añades texto junto a la URL, lo uso como instrucciones para ese resumen.
+
+Canales vigilados:
+/channels — lista los canales y si tienen prompt propio
+/add <url o @handle> — vigila un canal nuevo
+/remove <canal> — deja de vigilarlo
+
+Estilo de resumen:
+/prompt <canal> — muestra el prompt del canal
+/prompt <canal> <texto> — fija el prompt del canal
+/prompt <canal> reset — vuelve al prompt por defecto
+/default — muestra el prompt por defecto
+/default <texto> — cambia el prompt por defecto
+/default reset — restaura el prompt original
+
+<canal> puede ser el número de /channels, el @handle o parte del nombre."""
+
+
+def find_channel(channels: dict, ref: str) -> dict | None:
+    entries = list(channels["channels"].values())
+    ref = ref.strip()
+    if ref.isdigit() and 1 <= int(ref) <= len(entries):
+        return entries[int(ref) - 1]
+    low = ref.lower().lstrip("@")
+    for entry in entries:
+        if entry["id"].lower() == low or entry.get("handle", "").lower().lstrip("@") == low:
+            return entry
+    matches = [e for e in entries if low and low in e["name"].lower()]
+    return matches[0] if len(matches) == 1 else None
+
+
+def format_channels(channels: dict) -> str:
+    entries = list(channels["channels"].values())
+    if not entries:
+        return "No hay canales vigilados. Añade uno con /add <url o @handle>."
+    lines = ["Canales vigilados:"]
+    for i, entry in enumerate(entries, 1):
+        tag = "prompt propio" if entry.get("prompt") else "prompt por defecto"
+        lines.append(f"{i}. {entry['name']} ({entry.get('handle') or entry['id']}) — {tag}")
+    lines.append("\nPrompt por defecto: " + ("personalizado" if channels.get("default_prompt") else "original"))
+    return "\n".join(lines)
+
+
+def handle_command(text: str) -> str:
+    """Ejecuta un comando de gestión y devuelve el texto de respuesta."""
+    parts = text.strip().split(maxsplit=1)
+    command = parts[0].lower().split("@")[0]  # "/prompt@MiBot" -> "/prompt"
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    channels = load_channels()
+
+    if command in ("/start", "/help"):
+        return HELP_TEXT
+
+    if command == "/channels":
+        return format_channels(channels)
+
+    if command == "/add":
+        if not arg:
+            return "Uso: /add <url o @handle>"
+        try:
+            channel = resolve_channel(arg)
+        except Exception as exc:  # noqa: BLE001
+            return f"No he podido resolver ese canal: {str(exc).splitlines()[0][:200]}"
+        if channel["id"] in channels["channels"]:
+            return f"{channel['name']} ya estaba en la lista."
+        channels["channels"][channel["id"]] = channel | {"prompt": None}
+        save_channels(channels)
+        return f"✅ Vigilando {channel['name']} ({channel['url']}). Usa /prompt para darle un estilo propio."
+
+    if command == "/remove":
+        channel = find_channel(channels, arg) if arg else None
+        if not channel:
+            return "No encuentro ese canal. Uso: /remove <número, @handle o nombre>\n\n" + format_channels(channels)
+        del channels["channels"][channel["id"]]
+        save_channels(channels)
+        return f"🗑 Ya no vigilo {channel['name']}."
+
+    if command == "/prompt":
+        ref, _, new_prompt = arg.partition(" ") if not arg.startswith('"') else (arg, "", "")
+        # Permitir el texto en la línea siguiente: "/prompt @canal\ntexto..."
+        if "\n" in ref:
+            ref, _, rest = ref.partition("\n")
+            new_prompt = (rest + "\n" + new_prompt).strip()
+        channel = find_channel(channels, ref) if ref else None
+        if not channel:
+            return "No encuentro ese canal. Uso: /prompt <número, @handle o nombre> [texto | reset]\n\n" + format_channels(channels)
+        new_prompt = new_prompt.strip()
+        if not new_prompt:
+            current = channel.get("prompt")
+            return (f"Prompt de {channel['name']}:\n\n{current}" if current
+                    else f"{channel['name']} usa el prompt por defecto:\n\n{channels.get('default_prompt') or DEFAULT_INSTRUCTIONS}")
+        if new_prompt.lower() == "reset":
+            channel["prompt"] = None
+            save_channels(channels)
+            return f"✅ {channel['name']} vuelve a usar el prompt por defecto."
+        channel["prompt"] = new_prompt
+        save_channels(channels)
+        return f"✅ Prompt de {channel['name']} actualizado:\n\n{new_prompt}"
+
+    if command == "/default":
+        if not arg:
+            current = channels.get("default_prompt")
+            return f"Prompt por defecto ({'personalizado' if current else 'original'}):\n\n{current or DEFAULT_INSTRUCTIONS}"
+        if arg.lower() == "reset":
+            channels["default_prompt"] = None
+            save_channels(channels)
+            return "✅ Prompt por defecto restaurado al original."
+        channels["default_prompt"] = arg
+        save_channels(channels)
+        return f"✅ Prompt por defecto actualizado:\n\n{arg}"
+
+    return f"Comando desconocido: {command}\n\n{HELP_TEXT}"
+
+
+def handle_message(chat_id: int, text: str) -> None:
+    if text.startswith("/"):
+        send_message(chat_id, handle_command(text), preview=False)
+        return
+
+    ids = extract_video_ids(text)
+    if not ids:
+        send_message(chat_id, "No veo ninguna URL de YouTube en el mensaje.\n\n" + HELP_TEXT, preview=False)
+        return
+
+    # El texto que acompaña a las URLs son instrucciones puntuales para este resumen
+    extra = YOUTUBE_URL_RE.sub("", text)
+    extra = re.sub(r"[ \t]+", " ", extra).strip() or None
+
+    for vid in ids:
+        try:
+            process_video({"id": vid, "title": vid, "url": video_url(vid)}, chat_id, eager=True, extra_instructions=extra)
+        except Exception:  # noqa: BLE001
+            log.exception("Error procesando %s pedido por Telegram", vid)
 
 
 def handle_telegram_updates() -> None:
-    """Long-polling de Telegram: resume cualquier URL de YouTube que llegue al chat autorizado."""
-    state = load_state(CONFIG["state_file"])
+    """Long-polling de Telegram: atiende comandos y URLs del chat autorizado."""
+    state = load_state()
     updates = telegram_api(
         "getUpdates",
         offset=state["telegram_offset"],
@@ -480,9 +700,9 @@ def handle_telegram_updates() -> None:
     )
     for upd in updates:
         # Confirmamos el update antes de procesarlo para no repetirlo si algo falla a mitad
-        state = load_state(CONFIG["state_file"])
+        state = load_state()
         state["telegram_offset"] = upd["update_id"] + 1
-        save_state(CONFIG["state_file"], state)
+        save_state(state)
 
         msg = upd.get("message") or {}
         chat_id = (msg.get("chat") or {}).get("id")
@@ -490,25 +710,18 @@ def handle_telegram_updates() -> None:
         if str(chat_id) != str(CONFIG["telegram_chat_id"]):
             log.warning("Mensaje ignorado de chat no autorizado %s", chat_id)
             continue
+        try:
+            handle_message(chat_id, text)
+        except Exception:  # noqa: BLE001
+            log.exception("Error atendiendo el mensaje %r", text[:80])
 
-        ids = extract_video_ids(text)
-        if not ids:
-            if text.startswith("/"):
-                send_message(chat_id, HELP_TEXT, preview=False)
-            else:
-                send_message(chat_id, "No veo ninguna URL de YouTube en el mensaje.\n\n" + HELP_TEXT, preview=False)
-            continue
 
-        for vid in ids:
-            try:
-                process_video({"id": vid, "title": vid, "url": video_url(vid)}, "", chat_id, eager=True)
-            except Exception:  # noqa: BLE001
-                log.exception("Error procesando %s pedido por Telegram", vid)
+# --------------------------------------------------------------------------- main
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--once", action="store_true", help="Una sola pasada por el canal y termina (para cron)")
+    parser.add_argument("--once", action="store_true", help="Una sola pasada por los canales y termina (para cron)")
     parser.add_argument("--get-chat-id", action="store_true", help="Muestra los chat_id que han escrito al bot")
     parser.add_argument("--video", metavar="URL", help="Resume y envía un vídeo concreto (no toca el estado)")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -532,19 +745,19 @@ def main() -> None:
     if args.video:
         ids = extract_video_ids(args.video) or [args.video]
         for vid in ids:
-            ok = process_video({"id": vid, "title": vid, "url": video_url(vid)}, "", CONFIG["telegram_chat_id"], eager=True)
+            ok = process_video({"id": vid, "title": vid, "url": video_url(vid)}, CONFIG["telegram_chat_id"], eager=True)
             if not ok:
                 sys.exit("El vídeo no tiene subtítulos disponibles todavía")
         return
 
-    env("YOUTUBE_CHANNEL_ID", required=True)
+    seed_channels_from_env()
 
     if args.once:
-        check_channel()
+        check_channels()
         return
 
     log.info(
-        "Escuchando Telegram y comprobando el canal cada %.0f minutos (Ctrl+C para salir)",
+        "Escuchando Telegram y comprobando los canales cada %.0f minutos (Ctrl+C para salir)",
         CONFIG["poll_minutes"],
     )
     next_channel_check = 0.0
@@ -552,9 +765,9 @@ def main() -> None:
         if time.time() >= next_channel_check:
             next_channel_check = time.time() + CONFIG["poll_minutes"] * 60
             try:
-                check_channel()
+                check_channels()
             except Exception:  # noqa: BLE001
-                log.exception("Error comprobando el canal; se reintentará en la siguiente pasada")
+                log.exception("Error comprobando los canales; se reintentará en la siguiente pasada")
         try:
             handle_telegram_updates()  # bloquea hasta TELEGRAM_LONG_POLL_SECONDS si no hay mensajes
         except Exception:  # noqa: BLE001
