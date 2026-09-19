@@ -26,6 +26,8 @@ from pathlib import Path
 
 import requests
 import yt_dlp
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -66,6 +68,8 @@ CONFIG = {
 MAX_TRANSCRIPT_CHARS = 400_000
 TELEGRAM_MAX_LEN = 4000  # el límite real es 4096
 TELEGRAM_LONG_POLL_SECONDS = 25
+NETWORK_RETRIES = 3          # reintentos por llamada de red (Telegram, YouTube, Hetzner)
+NETWORK_BACKOFF_SECONDS = 3  # espera inicial entre reintentos (se duplica en cada uno)
 
 YOUTUBE_URL_RE = re.compile(
     r"(?:https?://)?(?:www\.|m\.)?"
@@ -79,6 +83,46 @@ DEFAULT_INSTRUCTIONS = (
     "3. 'Conclusión:' una frase con la postura o recomendación final del autor.\n"
     "Máximo ~300 palabras."
 )
+
+# --------------------------------------------------------------------------- errores y reintentos
+
+
+def short_error(exc: BaseException) -> str:
+    """Descripción de una línea de una excepción, sin el ruido de urllib3/requests."""
+    # requests envuelve el error real varias veces; nos quedamos con la causa más profunda
+    cause = exc
+    seen = set()
+    while id(cause) not in seen:
+        seen.add(id(cause))
+        nxt = cause.__cause__ or cause.__context__
+        if nxt is None:
+            break
+        cause = nxt
+    detail = (str(cause) or str(exc)).splitlines()[0] if (str(cause) or str(exc)) else ""
+    name = type(exc).__name__
+    return f"{name}: {detail}"[:300] if detail else name
+
+
+def log_error(message: str, exc: BaseException) -> None:
+    """Una línea en ERROR; el traceback completo solo con -v (DEBUG)."""
+    log.error("%s: %s", message, short_error(exc))
+    log.debug("Traceback:", exc_info=exc)
+
+
+def with_retries(what: str, fn, attempts: int = NETWORK_RETRIES):
+    """Ejecuta fn() reintentando con backoff exponencial."""
+    delay = NETWORK_BACKOFF_SECONDS
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            if attempt == attempts:
+                raise
+            log.warning("%s falló (intento %d/%d): %s. Reintentando en %ds…",
+                        what, attempt, attempts, short_error(exc), delay)
+            time.sleep(delay)
+            delay *= 2
+
 
 # --------------------------------------------------------------------------- ficheros JSON
 
@@ -186,7 +230,7 @@ def fetch_channel(channel_url: str, limit: int) -> tuple[dict, list[dict]]:
     """
     opts = ydl_base_opts() | {"extract_flat": "in_playlist", "playlistend": limit}
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(channel_url, download=False)
+        info = with_retries("Listado del canal", lambda: ydl.extract_info(channel_url, download=False))
     videos = []
     for entry in info.get("entries") or []:
         vid = entry.get("id")
@@ -231,7 +275,7 @@ def fetch_transcript(url: str, langs: list[str]) -> tuple[dict, str | None, str]
     Prioridad: subtítulos manuales > automáticos, en el orden de `langs`.
     """
     with yt_dlp.YoutubeDL(ydl_base_opts()) as ydl:
-        info = ydl.extract_info(url, download=False)
+        info = with_retries("Info del vídeo", lambda: ydl.extract_info(url, download=False))
         sources = (
             ("manual", info.get("subtitles") or {}),
             ("auto", info.get("automatic_captions") or {}),
@@ -288,7 +332,8 @@ def summarize(transcript: str, title: str, channel: str, duration_min: float | N
         log.warning("Transcripción muy larga (%d chars), se recorta", len(transcript))
         transcript = transcript[:MAX_TRANSCRIPT_CHARS]
 
-    client = OpenAI(base_url=CONFIG["hetzner_base_url"], api_key=CONFIG["hetzner_api_key"])
+    client = OpenAI(base_url=CONFIG["hetzner_base_url"], api_key=CONFIG["hetzner_api_key"],
+                    max_retries=NETWORK_RETRIES, timeout=180)
 
     system_prompt = (
         f"Eres un asistente que resume vídeos de YouTube a partir de su transcripción. "
@@ -324,12 +369,31 @@ def summarize(transcript: str, title: str, channel: str, duration_min: float | N
 # --------------------------------------------------------------------------- telegram
 
 
+class TelegramError(RuntimeError):
+    """Respuesta de la API de Telegram con ok=false (no es un error de red)."""
+
+
+def _telegram_session() -> requests.Session:
+    session = requests.Session()
+    # Reintentos a nivel de conexión (DNS, TLS, reset, timeout) y de códigos 5xx/429, con backoff
+    retry = Retry(total=NETWORK_RETRIES, connect=NETWORK_RETRIES, read=NETWORK_RETRIES,
+                  backoff_factor=NETWORK_BACKOFF_SECONDS, status_forcelist=(429, 500, 502, 503, 504),
+                  allowed_methods=frozenset({"POST"}), raise_on_status=False)
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
+
+
+TELEGRAM_SESSION = _telegram_session()
+
+
 def telegram_api(method: str, **payload) -> dict:
     url = f"https://api.telegram.org/bot{CONFIG['telegram_token']}/{method}"
-    resp = requests.post(url, json=payload, timeout=TELEGRAM_LONG_POLL_SECONDS + 15)
+    # (timeout de conexión, timeout de lectura): la lectura debe superar el long polling de getUpdates
+    timeout = (15, TELEGRAM_LONG_POLL_SECONDS + 15)
+    resp = TELEGRAM_SESSION.post(url, json=payload, timeout=timeout)
     data = resp.json()
     if not data.get("ok"):
-        raise RuntimeError(f"Telegram {method} falló: {data.get('description', data)}")
+        raise TelegramError(f"Telegram {method} falló: {data.get('description', data)}")
     return data["result"]
 
 
@@ -384,7 +448,7 @@ class ProgressMessage:
         try:
             telegram_api("editMessageText", chat_id=self.chat_id, message_id=self.message_id,
                          text=text, link_preview_options=options)
-        except RuntimeError as exc:
+        except TelegramError as exc:
             if "message is not modified" not in str(exc):
                 raise
 
@@ -438,7 +502,7 @@ def process_video(video: dict, chat_id: str | int, eager: bool, extra_instructio
         info, transcript, source = fetch_transcript(video["url"], CONFIG["subtitle_langs"])
     except Exception as exc:  # noqa: BLE001
         if eager:
-            progress.fail(f"No se pudo acceder al vídeo: {str(exc).splitlines()[0][:200]}")
+            progress.fail(f"No se pudo acceder al vídeo: {short_error(exc)}")
         raise
 
     progress.title = info.get("title") or progress.title
@@ -465,7 +529,7 @@ def process_video(video: dict, chat_id: str | int, eager: bool, extra_instructio
     try:
         summary = summarize(transcript, progress.title, channel_name, duration_min, instructions)
     except Exception as exc:  # noqa: BLE001
-        progress.fail(f"Error al resumir: {str(exc)[:200]}")
+        progress.fail(f"Error al resumir: {short_error(exc)}")
         raise
 
     progress.finish(summary)
@@ -510,8 +574,8 @@ def check_one_channel(channel: dict, state: dict, now: datetime) -> int:
 
         try:
             ok = process_video(video, CONFIG["telegram_chat_id"], eager=False)
-        except Exception:  # noqa: BLE001
-            log.exception("Error procesando %s; se reintentará en la siguiente pasada", video["id"])
+        except Exception as exc:  # noqa: BLE001
+            log_error(f"Error procesando {video['id']}; se reintentará en la siguiente pasada", exc)
             continue
 
         if ok:
@@ -536,8 +600,8 @@ def check_channels() -> None:
     for channel in channels["channels"].values():
         try:
             total += check_one_channel(channel, state, now)
-        except Exception:  # noqa: BLE001
-            log.exception("Error comprobando el canal %s", channel.get("name"))
+        except Exception as exc:  # noqa: BLE001
+            log_error(f"Error comprobando el canal {channel.get('name')}", exc)
     log.info("Pasada terminada: %d vídeo(s) resumido(s)", total)
 
 
@@ -616,7 +680,7 @@ def handle_command(text: str) -> str:
         try:
             channel = resolve_channel(arg)
         except Exception as exc:  # noqa: BLE001
-            return f"No he podido resolver ese canal: {str(exc).splitlines()[0][:200]}"
+            return f"No he podido resolver ese canal: {short_error(exc)}"
         if channel["id"] in channels["channels"]:
             return f"{channel['name']} ya estaba en la lista."
         channels["channels"][channel["id"]] = channel | {"prompt": None}
@@ -685,8 +749,8 @@ def handle_message(chat_id: int, text: str) -> None:
     for vid in ids:
         try:
             process_video({"id": vid, "title": vid, "url": video_url(vid)}, chat_id, eager=True, extra_instructions=extra)
-        except Exception:  # noqa: BLE001
-            log.exception("Error procesando %s pedido por Telegram", vid)
+        except Exception as exc:  # noqa: BLE001
+            log_error(f"Error procesando {vid} pedido por Telegram", exc)
 
 
 def handle_telegram_updates() -> None:
@@ -712,8 +776,8 @@ def handle_telegram_updates() -> None:
             continue
         try:
             handle_message(chat_id, text)
-        except Exception:  # noqa: BLE001
-            log.exception("Error atendiendo el mensaje %r", text[:80])
+        except Exception as exc:  # noqa: BLE001
+            log_error(f"Error atendiendo el mensaje {text[:60]!r}", exc)
 
 
 # --------------------------------------------------------------------------- main
@@ -732,7 +796,8 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    for noisy in ("httpx", "httpx2", "httpcore", "urllib3"):  # el SDK de OpenAI usa un fork llamado httpx2
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     env("TELEGRAM_BOT_API_KEY", required=True)
     if args.get_chat_id:
@@ -761,18 +826,25 @@ def main() -> None:
         CONFIG["poll_minutes"],
     )
     next_channel_check = 0.0
+    telegram_failures = 0
     while True:
         if time.time() >= next_channel_check:
             next_channel_check = time.time() + CONFIG["poll_minutes"] * 60
             try:
                 check_channels()
-            except Exception:  # noqa: BLE001
-                log.exception("Error comprobando los canales; se reintentará en la siguiente pasada")
+            except Exception as exc:  # noqa: BLE001
+                log_error("Error comprobando los canales; se reintentará en la siguiente pasada", exc)
         try:
             handle_telegram_updates()  # bloquea hasta TELEGRAM_LONG_POLL_SECONDS si no hay mensajes
-        except Exception:  # noqa: BLE001
-            log.exception("Error atendiendo Telegram")
-            time.sleep(5)
+            if telegram_failures:
+                log.info("Conexión con Telegram recuperada")
+            telegram_failures = 0
+        except Exception as exc:  # noqa: BLE001
+            telegram_failures += 1
+            wait = min(5 * 2 ** (telegram_failures - 1), 120)
+            log.warning("Telegram no responde (%s). Reintento %d en %ds", short_error(exc), telegram_failures, wait)
+            log.debug("Traceback:", exc_info=exc)
+            time.sleep(wait)
 
 
 if __name__ == "__main__":
