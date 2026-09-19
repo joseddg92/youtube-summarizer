@@ -2,7 +2,8 @@
 
 Vigila un canal de YouTube, descarga los subtítulos de cada vídeo nuevo con **yt-dlp**,
 los resume con la **Inference API de Hetzner** (compatible con OpenAI) y te manda el
-resumen + enlace por **Telegram**.
+resumen + enlace por **Telegram**. También puedes enviarle al bot cualquier URL de YouTube
+y te la resume al momento, editando un mensaje de progreso mientras trabaja.
 
 ## Instalación
 
@@ -30,10 +31,13 @@ El resto de variables están comentadas en [.env.example](.env.example).
 ## Uso
 
 ```bash
-python main.py --once            # una pasada (para cron / launchd)
-python main.py                   # bucle cada POLL_INTERVAL_MINUTES
+python main.py                   # modo bot: escucha Telegram + comprueba el canal cada POLL_INTERVAL_MINUTES
+python main.py --once            # una pasada por el canal y sale (para cron / launchd; no escucha Telegram)
 python main.py --video <URL>     # prueba con un vídeo concreto
 ```
+
+En modo bot, cualquier mensaje con URLs de YouTube que envíes al chat configurado
+(`TELEGRAM_CHAT_ID`) se resume al instante; mensajes de otros chats se ignoran.
 
 En la primera ejecución solo se resumen los `FIRST_RUN_VIDEOS` vídeos más recientes; el
 resto se marcan como vistos en `state.json` para no inundar el chat.
@@ -48,7 +52,7 @@ Ejemplo de cron (cada 30 min):
 
 1. `yt-dlp` lista los últimos `CHECK_LATEST_N` vídeos de la pestaña *Videos* del canal (sin descargar nada).
 2. Para cada vídeo no visto, obtiene los subtítulos (manuales > automáticos) en formato `json3` y los convierte a texto plano. Si el vídeo es un directo o aún no tiene subtítulos, se reintenta en la siguiente pasada (hasta `GIVE_UP_AFTER_HOURS`).
-3. Envía la transcripción a `POST {HETZNER_INFERENCE_BASE_URL}/chat/completions` con el SDK de OpenAI.
-4. Manda `🎬 título + enlace + resumen` por Telegram (troceado si supera 4096 caracteres).
+3. Envía la transcripción a `POST {HETZNER_INFERENCE_BASE_URL}/chat/completions` con el SDK de OpenAI (con `enable_thinking: false`; si no, Qwen gasta todos los tokens razonando y devuelve una respuesta vacía).
+4. Manda `🎬 título + enlace + resumen` por Telegram (troceado si supera 4096 caracteres). Mientras trabaja, edita un mensaje con el progreso ("Obteniendo subtítulos…", "Resumiendo…").
 
 Límites de la API de Hetzner (por token): 10 peticiones/min, 4M tokens de entrada/min. `MAX_VIDEOS_PER_RUN` evita superarlos.

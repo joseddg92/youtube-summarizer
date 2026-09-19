@@ -2,11 +2,12 @@
 """
 Vigila un canal de YouTube, descarga los subtítulos de los vídeos nuevos (vía yt-dlp),
 los resume con la Inference API de Hetzner (compatible con OpenAI) y envía el resumen
-junto con el enlace por Telegram.
+junto con el enlace por Telegram. Además, escucha el bot de Telegram: cualquier URL de
+YouTube que le envíes se resume al momento.
 
 Uso:
-    python main.py                # bucle: comprueba cada POLL_INTERVAL_MINUTES
-    python main.py --once         # una sola pasada (ideal para cron)
+    python main.py                # bucle: escucha Telegram y comprueba el canal cada POLL_INTERVAL_MINUTES
+    python main.py --once         # una sola pasada por el canal (ideal para cron; no escucha Telegram)
     python main.py --get-chat-id  # ayuda para obtener TELEGRAM_CHAT_ID
     python main.py --video URL    # resume un vídeo concreto (ignora el estado)
 """
@@ -62,6 +63,13 @@ CONFIG = {
 # Límite de seguridad para la transcripción (~100k tokens; el modelo admite 262k)
 MAX_TRANSCRIPT_CHARS = 400_000
 TELEGRAM_MAX_LEN = 4000  # el límite real es 4096
+TELEGRAM_LONG_POLL_SECONDS = 25
+
+YOUTUBE_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.|m\.)?"
+    r"(?:youtube\.com/(?:watch\?(?:[^\s]*&)?v=|shorts/|live/|embed/)|youtu\.be/)"
+    r"([\w-]{11})"
+)
 
 # --------------------------------------------------------------------------- estado
 
@@ -74,6 +82,7 @@ def load_state(path: Path) -> dict:
         state = {}
     state.setdefault("processed", {})  # video_id -> info
     state.setdefault("pending", {})    # video_id -> primera vez visto (ISO)
+    state.setdefault("telegram_offset", 0)
     return state
 
 
@@ -104,6 +113,20 @@ def normalize_channel_url(channel: str) -> str:
     return url
 
 
+def video_url(video_id: str) -> str:
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def extract_video_ids(text: str) -> list[str]:
+    """Devuelve los IDs de vídeo de YouTube que aparecen en un texto (sin duplicados, en orden)."""
+    ids = []
+    for match in YOUTUBE_URL_RE.finditer(text):
+        vid = match.group(1)
+        if vid not in ids:
+            ids.append(vid)
+    return ids
+
+
 def ydl_base_opts() -> dict:
     opts = {
         "quiet": True,
@@ -130,11 +153,7 @@ def list_latest_videos(channel_url: str, limit: int) -> list[dict]:
         vid = entry.get("id")
         if not vid:
             continue
-        videos.append({
-            "id": vid,
-            "title": entry.get("title") or vid,
-            "url": f"https://www.youtube.com/watch?v={vid}",
-        })
+        videos.append({"id": vid, "title": entry.get("title") or vid, "url": video_url(vid)})
     return videos
 
 
@@ -151,14 +170,14 @@ def parse_json3(raw: bytes) -> str:
     return " ".join(lines)
 
 
-def fetch_transcript(video_url: str, langs: list[str]) -> tuple[dict, str | None, str]:
+def fetch_transcript(url: str, langs: list[str]) -> tuple[dict, str | None, str]:
     """
     Extrae info del vídeo y su transcripción.
     Devuelve (info, texto|None, descripción de la fuente).
     Prioridad: subtítulos manuales > automáticos, en el orden de `langs`.
     """
     with yt_dlp.YoutubeDL(ydl_base_opts()) as ydl:
-        info = ydl.extract_info(video_url, download=False)
+        info = ydl.extract_info(url, download=False)
         sources = (
             ("manual", info.get("subtitles") or {}),
             ("auto", info.get("automatic_captions") or {}),
@@ -183,6 +202,16 @@ def fetch_transcript(video_url: str, langs: list[str]) -> tuple[dict, str | None
 
 
 # --------------------------------------------------------------------------- resumen
+
+
+def clean_summary(text: str) -> str:
+    # Los modelos Qwen "thinking" pueden colar el razonamiento entre <think>...</think>
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    # Quitar restos de Markdown que el modelo insiste en usar
+    text = re.sub(r"^\s*[\*•]\s+", "- ", text, flags=re.M)
+    text = re.sub(r"^#+\s*", "", text, flags=re.M)
+    text = text.replace("**", "")
+    return text.strip()
 
 
 def summarize(transcript: str, title: str, channel: str, duration_min: float | None) -> str:
@@ -216,10 +245,13 @@ def summarize(transcript: str, title: str, channel: str, duration_min: float | N
         ],
         temperature=0.3,
         max_tokens=1500,
+        # Qwen3 es un modelo "thinking": sin esto gasta todos los tokens razonando y devuelve content vacío
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
-    text = response.choices[0].message.content or ""
-    # Los modelos Qwen "thinking" pueden devolver el razonamiento entre <think>...</think>
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+    choice = response.choices[0]
+    text = clean_summary(choice.message.content or "")
+    if not text:
+        raise RuntimeError(f"El modelo devolvió una respuesta vacía (finish_reason={choice.finish_reason})")
     return text
 
 
@@ -228,10 +260,10 @@ def summarize(transcript: str, title: str, channel: str, duration_min: float | N
 
 def telegram_api(method: str, **payload) -> dict:
     url = f"https://api.telegram.org/bot{CONFIG['telegram_token']}/{method}"
-    resp = requests.post(url, json=payload, timeout=30)
+    resp = requests.post(url, json=payload, timeout=TELEGRAM_LONG_POLL_SECONDS + 15)
     data = resp.json()
     if not data.get("ok"):
-        raise RuntimeError(f"Telegram {method} falló: {data}")
+        raise RuntimeError(f"Telegram {method} falló: {data.get('description', data)}")
     return data["result"]
 
 
@@ -248,14 +280,60 @@ def split_message(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
     return chunks
 
 
-def send_telegram(text: str) -> None:
+def send_message(chat_id: str | int, text: str, preview: bool = True) -> int:
+    """Envía un mensaje (troceado si hace falta). Devuelve el message_id del primer trozo."""
+    first_id = None
     for i, chunk in enumerate(split_message(text)):
-        telegram_api(
+        result = telegram_api(
             "sendMessage",
-            chat_id=CONFIG["telegram_chat_id"],
+            chat_id=chat_id,
             text=chunk,
-            disable_web_page_preview=(i > 0),  # solo el primer trozo muestra la previsualización del vídeo
+            link_preview_options={"is_disabled": not (preview and i == 0), "prefer_small_media": True},
         )
+        first_id = first_id or result["message_id"]
+    return first_id
+
+
+class ProgressMessage:
+    """
+    Un mensaje de Telegram que se va editando con el estado del proceso
+    y que finalmente se convierte en el resumen.
+    """
+
+    def __init__(self, chat_id: str | int, url: str, title: str | None = None):
+        self.chat_id = chat_id
+        self.url = url
+        self.title = title
+        self.message_id: int | None = None
+
+    def _header(self) -> str:
+        return f"🎬 {self.title}\n{self.url}" if self.title else f"🎬 {self.url}"
+
+    def _render(self, chat_id, text: str, preview: bool) -> None:
+        options = {"is_disabled": not preview, "prefer_small_media": True}
+        if self.message_id is None:
+            result = telegram_api("sendMessage", chat_id=chat_id, text=text, link_preview_options=options)
+            self.message_id = result["message_id"]
+            return
+        try:
+            telegram_api("editMessageText", chat_id=chat_id, message_id=self.message_id,
+                         text=text, link_preview_options=options)
+        except RuntimeError as exc:
+            if "message is not modified" not in str(exc):
+                raise
+
+    def update(self, status: str) -> None:
+        # Sin previsualización mientras trabaja, para que el mensaje se vea compacto
+        self._render(self.chat_id, f"{self._header()}\n\n⏳ {status}", preview=False)
+
+    def finish(self, summary: str) -> None:
+        chunks = split_message(f"{self._header()}\n\n{summary}")
+        self._render(self.chat_id, chunks[0], preview=True)
+        for chunk in chunks[1:]:
+            send_message(self.chat_id, chunk, preview=False)
+
+    def fail(self, reason: str) -> None:
+        self._render(self.chat_id, f"{self._header()}\n\n❌ {reason}", preview=False)
 
 
 def print_chat_ids() -> None:
@@ -277,34 +355,60 @@ def print_chat_ids() -> None:
 # --------------------------------------------------------------------------- flujo principal
 
 
-def process_video(video: dict, channel_name: str) -> bool:
-    """Descarga subtítulos, resume y envía. Devuelve True si se completó, False si aún no hay subtítulos."""
-    log.info("Procesando %s — %s", video["id"], video["title"])
-    info, transcript, source = fetch_transcript(video["url"], CONFIG["subtitle_langs"])
+def process_video(video: dict, channel_name: str, chat_id: str | int, eager: bool) -> bool:
+    """
+    Descarga subtítulos, resume y envía. Devuelve True si se completó, False si aún no hay subtítulos.
 
+    eager=True: envía el mensaje de progreso desde el principio (petición manual por Telegram).
+    eager=False: solo empieza a escribir en Telegram cuando ya hay transcripción, para no
+                 llenar el chat con reintentos de vídeos recién subidos sin subtítulos.
+    """
+    log.info("Procesando %s — %s", video["id"], video["title"])
+    progress = ProgressMessage(chat_id, video["url"], video.get("title") if video.get("title") != video["id"] else None)
+    if eager:
+        progress.update("Obteniendo subtítulos…")
+
+    try:
+        info, transcript, source = fetch_transcript(video["url"], CONFIG["subtitle_langs"])
+    except Exception as exc:  # noqa: BLE001
+        if eager:
+            progress.fail(f"No se pudo acceder al vídeo: {str(exc).splitlines()[0][:200]}")
+        raise
+
+    progress.title = info.get("title") or progress.title
     live_status = info.get("live_status")
     if live_status in ("is_live", "is_upcoming"):
         log.info("Vídeo en directo/programado (%s), se reintentará más tarde", live_status)
+        if eager:
+            progress.fail("Es un directo o un vídeo programado; todavía no tiene transcripción.")
         return False
     if not transcript:
         log.info("Todavía no hay subtítulos disponibles, se reintentará más tarde")
+        if eager:
+            progress.fail("El vídeo no tiene subtítulos disponibles (aún).")
         return False
 
-    title = info.get("title") or video["title"]
     duration_min = (info.get("duration") or 0) / 60 or None
     log.info("Transcripción obtenida (%s, %d chars). Resumiendo con %s…", source, len(transcript), CONFIG["hetzner_model"])
-    summary = summarize(transcript, title, info.get("channel") or channel_name, duration_min)
+    details = f"{duration_min:.0f} min, " if duration_min else ""
+    progress.update(f"Resumiendo ({details}{len(transcript) // 1000}k caracteres de transcripción)…")
 
-    message = f"🎬 {title}\n{video['url']}\n\n{summary}"
-    send_telegram(message)
+    try:
+        summary = summarize(transcript, progress.title, info.get("channel") or channel_name, duration_min)
+    except Exception as exc:  # noqa: BLE001
+        progress.fail(f"Error al resumir: {str(exc)[:200]}")
+        raise
+
+    progress.finish(summary)
     log.info("Resumen enviado por Telegram")
     return True
 
 
-def run_once() -> None:
+def check_channel() -> None:
+    """Una pasada por el canal: resume los vídeos nuevos."""
     channel_url = normalize_channel_url(CONFIG["channel"])
     state = load_state(CONFIG["state_file"])
-    first_run = not CONFIG["state_file"].exists()
+    first_run = not state["processed"]
 
     videos = list_latest_videos(channel_url, CONFIG["check_latest_n"])
     if not videos:
@@ -341,11 +445,13 @@ def run_once() -> None:
                 continue
 
         try:
-            ok = process_video(video, CONFIG["channel"])
+            ok = process_video(video, CONFIG["channel"], CONFIG["telegram_chat_id"], eager=False)
         except Exception:  # noqa: BLE001
             log.exception("Error procesando %s; se reintentará en la siguiente pasada", video["id"])
             continue
 
+        # Recargamos por si handle_telegram_updates ha tocado el fichero mientras tanto
+        state = load_state(CONFIG["state_file"])
         if ok:
             state["processed"][video["id"]] = {"title": video["title"], "at": now.isoformat()}
             state["pending"].pop(video["id"], None)
@@ -357,9 +463,52 @@ def run_once() -> None:
     log.info("Pasada terminada: %d vídeo(s) resumido(s)", done)
 
 
+HELP_TEXT = (
+    "Envíame una o varias URLs de YouTube y te devuelvo un resumen del vídeo.\n"
+    "Además vigilo el canal configurado y te aviso de los vídeos nuevos."
+)
+
+
+def handle_telegram_updates() -> None:
+    """Long-polling de Telegram: resume cualquier URL de YouTube que llegue al chat autorizado."""
+    state = load_state(CONFIG["state_file"])
+    updates = telegram_api(
+        "getUpdates",
+        offset=state["telegram_offset"],
+        timeout=TELEGRAM_LONG_POLL_SECONDS,
+        allowed_updates=["message"],
+    )
+    for upd in updates:
+        # Confirmamos el update antes de procesarlo para no repetirlo si algo falla a mitad
+        state = load_state(CONFIG["state_file"])
+        state["telegram_offset"] = upd["update_id"] + 1
+        save_state(CONFIG["state_file"], state)
+
+        msg = upd.get("message") or {}
+        chat_id = (msg.get("chat") or {}).get("id")
+        text = msg.get("text") or msg.get("caption") or ""
+        if str(chat_id) != str(CONFIG["telegram_chat_id"]):
+            log.warning("Mensaje ignorado de chat no autorizado %s", chat_id)
+            continue
+
+        ids = extract_video_ids(text)
+        if not ids:
+            if text.startswith("/"):
+                send_message(chat_id, HELP_TEXT, preview=False)
+            else:
+                send_message(chat_id, "No veo ninguna URL de YouTube en el mensaje.\n\n" + HELP_TEXT, preview=False)
+            continue
+
+        for vid in ids:
+            try:
+                process_video({"id": vid, "title": vid, "url": video_url(vid)}, "", chat_id, eager=True)
+            except Exception:  # noqa: BLE001
+                log.exception("Error procesando %s pedido por Telegram", vid)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--once", action="store_true", help="Ejecuta una sola pasada y termina (para cron)")
+    parser.add_argument("--once", action="store_true", help="Una sola pasada por el canal y termina (para cron)")
     parser.add_argument("--get-chat-id", action="store_true", help="Muestra los chat_id que han escrito al bot")
     parser.add_argument("--video", metavar="URL", help="Resume y envía un vídeo concreto (no toca el estado)")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -370,6 +519,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     env("TELEGRAM_BOT_API_KEY", required=True)
     if args.get_chat_id:
@@ -380,28 +530,36 @@ def main() -> None:
     env("TELEGRAM_CHAT_ID", required=True)
 
     if args.video:
-        match = re.search(r"(?:v=|youtu\.be/|shorts/)([\w-]{11})", args.video)
-        vid = match.group(1) if match else args.video
-        ok = process_video({"id": vid, "title": vid, "url": f"https://www.youtube.com/watch?v={vid}"}, "")
-        if not ok:
-            sys.exit("El vídeo no tiene subtítulos disponibles todavía")
+        ids = extract_video_ids(args.video) or [args.video]
+        for vid in ids:
+            ok = process_video({"id": vid, "title": vid, "url": video_url(vid)}, "", CONFIG["telegram_chat_id"], eager=True)
+            if not ok:
+                sys.exit("El vídeo no tiene subtítulos disponibles todavía")
         return
 
     env("YOUTUBE_CHANNEL_ID", required=True)
 
     if args.once:
-        run_once()
+        check_channel()
         return
 
-    log.info("Modo bucle: comprobando cada %.0f minutos (Ctrl+C para salir)", CONFIG["poll_minutes"])
+    log.info(
+        "Escuchando Telegram y comprobando el canal cada %.0f minutos (Ctrl+C para salir)",
+        CONFIG["poll_minutes"],
+    )
+    next_channel_check = 0.0
     while True:
+        if time.time() >= next_channel_check:
+            next_channel_check = time.time() + CONFIG["poll_minutes"] * 60
+            try:
+                check_channel()
+            except Exception:  # noqa: BLE001
+                log.exception("Error comprobando el canal; se reintentará en la siguiente pasada")
         try:
-            run_once()
-        except KeyboardInterrupt:
-            raise
+            handle_telegram_updates()  # bloquea hasta TELEGRAM_LONG_POLL_SECONDS si no hay mensajes
         except Exception:  # noqa: BLE001
-            log.exception("Error en la pasada; se reintentará en la siguiente")
-        time.sleep(CONFIG["poll_minutes"] * 60)
+            log.exception("Error atendiendo Telegram")
+            time.sleep(5)
 
 
 if __name__ == "__main__":
