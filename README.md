@@ -21,7 +21,7 @@ cp .env.example .env   # y rellena las claves
 | `YOUTUBE_CHANNEL_ID` | URL, `@handle` o ID `UC…` del canal (ej. `https://www.youtube.com/@MeetKevin`) |
 | `TELEGRAM_BOT_API_KEY` | Token que te da [@BotFather](https://t.me/BotFather) |
 | `TELEGRAM_CHAT_ID` | Chat destino. Escribe algo a tu bot y ejecuta `python main.py --get-chat-id` |
-| `YTDLP_COOKIES_FROM_BROWSER` | Navegador del que leer cookies de YouTube (`chrome`, `firefox`, `safari`…). Necesario porque YouTube devuelve *"Sign in to confirm you're not a bot"* sin cookies |
+| `YTDLP_COOKIES_FROM_BROWSER` | Opcional. Solo si YouTube devuelve *"Sign in to confirm you're not a bot"* (pasa tras muchas peticiones seguidas o desde IPs de datacenter): navegador del que leer cookies (`firefox`, `chrome`, `safari`, `brave`…) |
 | `SUBTITLE_LANGUAGES` | Idiomas de subtítulos a intentar, en orden (`en,es`) |
 | `SUMMARY_LANGUAGE` | Idioma del resumen (`español`) |
 
