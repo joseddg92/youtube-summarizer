@@ -1,0 +1,4 @@
+yt-dlp>=2025.1.1
+openai>=1.50
+python-dotenv>=1.0
+requests>=2.32
