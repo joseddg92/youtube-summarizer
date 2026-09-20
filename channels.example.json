@@ -7,6 +7,16 @@
       "handle": "@MeetKevin",
       "url": "https://www.youtube.com/@MeetKevin",
       "prompt": "Resume enfocado a un trader. Di al principio del mensaje qué pronósticos se esperan (qué índices, sectores o acciones cree que subirán o bajarán, cuánto y en qué timeframe), con una viñeta por pronóstico. Después la justificación que da para cada uno (datos, noticias, indicadores). Por último un resumen breve del resto del vídeo y otros temas tratados. Si no hace ningún pronóstico concreto, dilo explícitamente. Máximo ~350 palabras."
+    },
+    "UCDpE0dCtPTJZKAr8psiAHQw": {
+      "id": "UCDpE0dCtPTJZKAr8psiAHQw",
+      "name": "La Pizarra de Andrés Live",
+      "handle": "@LaPizarradeAndrésLive",
+      "url": "https://www.youtube.com/@LaPizarradeAndrésLive",
+      "tabs": [
+        "streams"
+      ],
+      "prompt": "Resume orientado a un inversor particular español que opera con Interactive Brokers y MyInvestor. Empieza con 'Recomendaciones:' listando cada fondo, ETF o acción sobre la que se dé una opinión (comprar, mantener, vender, evitar), con el motivo y, si se menciona, precio objetivo, plazo o peso en cartera. Solo si el vídeo lo aclara, indica si el producto es accesible desde MyInvestor (fondos con ISIN) o desde Interactive Brokers (acciones y ETFs). Después 'Mercado y macro:' con la visión general del mercado que se comente. Por último 'Resumen general:' con el resto de temas tratados (dudas de espectadores, fiscalidad, noticias, etc.). Si no hay recomendaciones concretas, dilo explícitamente. Máximo ~400 palabras."
     }
   }
 }

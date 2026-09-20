@@ -50,8 +50,9 @@ Los canales vigilados y su prompt viven en `channels.json` (ver
 | Comando | Qué hace |
 |---|---|
 | `/channels` | Lista los canales y si tienen prompt propio |
-| `/add <url o @handle>` | Vigila un canal nuevo |
+| `/add <url o @handle>` | Vigila un canal nuevo. Si la URL acaba en `/streams`, vigila los directos en vez de los vídeos |
 | `/remove <canal>` | Deja de vigilarlo |
+| `/tabs <canal> videos\|streams\|both` | Qué pestaña del canal vigilar (vídeos normales, directos o ambas) |
 | `/prompt <canal>` | Muestra el prompt del canal |
 | `/prompt <canal> <texto>` | Fija el prompt del canal (el texto puede ir en la línea siguiente) |
 | `/prompt <canal> reset` | Vuelve al prompt por defecto |
@@ -60,7 +61,8 @@ Los canales vigilados y su prompt viven en `channels.json` (ver
 `<canal>` puede ser el número que sale en `/channels`, el `@handle` o parte del nombre.
 
 El prompt de un canal se aplica tanto a los vídeos nuevos detectados como a cualquier URL suya
-que envíes a mano (se identifica por el `channel_id` del vídeo). El prompt describe solo el
+que envíes a mano (se identifica por el `channel_id` del vídeo). Los vídeos resumidos a mano
+(`--video` o URL por Telegram) se marcan como procesados para que el vigilante no los repita. El prompt describe solo el
 enfoque y la estructura; el idioma, el formato de texto plano y la fidelidad al contenido se
 imponen siempre.
 
@@ -76,7 +78,7 @@ Ejemplo de cron (cada 30 min):
 ## Cómo funciona
 
 1. `yt-dlp` lista los últimos `CHECK_LATEST_N` vídeos de la pestaña *Videos* del canal (sin descargar nada).
-2. Para cada vídeo no visto, obtiene los subtítulos (manuales > automáticos) en formato `json3` y los convierte a texto plano. Si el vídeo es un directo o aún no tiene subtítulos, se reintenta en la siguiente pasada (hasta `GIVE_UP_AFTER_HOURS`).
+2. Para cada vídeo no visto, obtiene los subtítulos en formato `json3` y los convierte a texto plano. Prioridad: manuales en `SUBTITLE_LANGUAGES` > automáticos en el idioma original del vídeo (`xx-orig`, mejor que las traducciones automáticas) > automáticos en `SUBTITLE_LANGUAGES`. Si el vídeo está en directo o aún no tiene subtítulos (los directos recién terminados tardan horas en tenerlos), se reintenta en cada pasada hasta `GIVE_UP_AFTER_HOURS`.
 3. Envía la transcripción a `POST {HETZNER_INFERENCE_BASE_URL}/chat/completions` con el SDK de OpenAI (con `enable_thinking: false`; si no, Qwen gasta todos los tokens razonando y devuelve una respuesta vacía).
 4. Manda `🎬 título + enlace + resumen` por Telegram (troceado si supera 4096 caracteres). Mientras trabaja, edita un mensaje con el progreso ("Obteniendo subtítulos…", "Resumiendo…").
 

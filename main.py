@@ -176,8 +176,11 @@ def save_channels(channels: dict) -> None:
 # --------------------------------------------------------------------------- youtube
 
 
-def normalize_channel_url(channel: str) -> str:
-    """Convierte URL / @handle / UC... en la URL de la pestaña de vídeos del canal."""
+CHANNEL_TABS = ("videos", "streams")  # pestañas del canal que se pueden vigilar
+
+
+def normalize_channel_url(channel: str, tab: str = "videos") -> str:
+    """Convierte URL / @handle / UC... en la URL de una pestaña del canal (videos o streams)."""
     channel = channel.strip()
     if channel.startswith("http"):
         url = channel.rstrip("/")
@@ -187,10 +190,18 @@ def normalize_channel_url(channel: str) -> str:
         url = f"https://www.youtube.com/channel/{channel}"
     else:
         url = f"https://www.youtube.com/@{channel}"
-    # Si ya apunta a una pestaña concreta (videos, streams, shorts...) la respetamos
-    if not re.search(r"/(videos|streams|shorts|live)$", url):
-        url += "/videos"
-    return url
+    url = re.sub(r"/(videos|streams|shorts|live|featured)$", "", url)
+    return f"{url}/{tab}"
+
+
+def tab_from_url(ref: str) -> str | None:
+    """Si la URL apunta a una pestaña concreta (/videos, /streams) la devuelve."""
+    match = re.search(r"/(videos|streams)/?$", ref.strip())
+    return match.group(1) if match else None
+
+
+def channel_tabs(channel: dict) -> list[str]:
+    return channel.get("tabs") or ["videos"]
 
 
 def video_url(video_id: str) -> str:
@@ -241,8 +252,9 @@ def fetch_channel(channel_url: str, limit: int) -> tuple[dict, list[dict]]:
 
 
 def resolve_channel(ref: str) -> dict:
-    """Convierte una URL/@handle/ID en un registro de canal {id, name, handle, url}."""
-    info, _ = fetch_channel(normalize_channel_url(ref), 1)
+    """Convierte una URL/@handle/ID en un registro de canal {id, name, handle, url, tabs}."""
+    tab = tab_from_url(ref) or "videos"
+    info, _ = fetch_channel(normalize_channel_url(ref, tab), 1)
     channel_id = info.get("channel_id") or info.get("id")
     if not channel_id or not channel_id.startswith("UC"):
         raise ValueError(f"No parece un canal de YouTube: {ref}")
@@ -252,6 +264,7 @@ def resolve_channel(ref: str) -> dict:
         "name": info.get("channel") or info.get("uploader") or handle or channel_id,
         "handle": handle if handle.startswith("@") else "",
         "url": f"https://www.youtube.com/{handle}" if handle.startswith("@") else f"https://www.youtube.com/channel/{channel_id}",
+        "tabs": [tab],
     }
 
 
@@ -276,26 +289,35 @@ def fetch_transcript(url: str, langs: list[str]) -> tuple[dict, str | None, str]
     """
     with yt_dlp.YoutubeDL(ydl_base_opts()) as ydl:
         info = with_retries("Info del vídeo", lambda: ydl.extract_info(url, download=False))
-        sources = (
-            ("manual", info.get("subtitles") or {}),
-            ("auto", info.get("automatic_captions") or {}),
-        )
-        for kind, table in sources:
-            for lang in langs:
-                for key, formats in table.items():
-                    if key != lang and not key.startswith(lang + "-"):
-                        continue
-                    fmt = next((f for f in formats if f.get("ext") == "json3" and f.get("url")), None)
-                    if not fmt:
-                        continue
-                    try:
-                        raw = ydl.urlopen(fmt["url"]).read()
-                        text = parse_json3(raw)
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning("No se pudo descargar subtítulo %s/%s: %s", kind, key, exc)
-                        continue
-                    if text:
-                        return info, text, f"{kind}/{key}"
+        # "live_chat" aparece como subtítulo manual en los directos, pero es la repetición del chat
+        manual = {k: v for k, v in (info.get("subtitles") or {}).items() if k != "live_chat"}
+        auto = info.get("automatic_captions") or {}
+        # Orden de preferencia: manuales en nuestros idiomas > automáticos en el idioma ORIGINAL
+        # del vídeo (clave "xx-orig"; las demás son traducciones automáticas, peores) > automáticos
+        # en nuestros idiomas > cualquier manual.
+        candidates: list[tuple[str, str, list]] = []
+        for lang in langs:
+            candidates += [("manual", k, f) for k, f in manual.items() if k == lang or k.startswith(lang + "-")]
+        candidates += [("auto", k, f) for k, f in auto.items() if k.endswith("-orig")]
+        for lang in langs:
+            candidates += [("auto", k, f) for k, f in auto.items() if k == lang or k.startswith(lang + "-")]
+        candidates += [("manual", k, f) for k, f in manual.items()]
+        seen: set[tuple[str, str]] = set()
+        for kind, key, formats in candidates:
+            if (kind, key) in seen:
+                continue
+            seen.add((kind, key))
+            fmt = next((f for f in formats if f.get("ext") == "json3" and f.get("url")), None)
+            if not fmt:
+                continue
+            try:
+                raw = with_retries(f"Subtítulo {kind}/{key}", lambda: ydl.urlopen(fmt["url"]).read(), attempts=2)
+                text = parse_json3(raw)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("No se pudo descargar subtítulo %s/%s: %s", kind, key, short_error(exc))
+                continue
+            if text:
+                return info, text, f"{kind}/{key}"
     return info, None, ""
 
 
@@ -485,6 +507,13 @@ def print_chat_ids() -> None:
 # --------------------------------------------------------------------------- flujo principal
 
 
+def mark_processed(video_id: str, title: str, **extra) -> None:
+    state = load_state()
+    state["processed"][video_id] = {"title": title, "at": datetime.now(timezone.utc).isoformat(), **extra}
+    state["pending"].pop(video_id, None)
+    save_state(state)
+
+
 def process_video(video: dict, chat_id: str | int, eager: bool, extra_instructions: str | None = None) -> bool:
     """
     Descarga subtítulos, resume y envía. Devuelve True si se completó, False si aún no hay subtítulos.
@@ -534,16 +563,22 @@ def process_video(video: dict, chat_id: str | int, eager: bool, extra_instructio
 
     progress.finish(summary)
     log.info("Resumen enviado por Telegram")
+    if eager:
+        # Resumido a mano: que el vigilante de canales no lo vuelva a enviar
+        mark_processed(video["id"], progress.title or video["id"], manual=True)
     return True
 
 
 def check_one_channel(channel: dict, state: dict, now: datetime) -> int:
     """Una pasada por un canal. Devuelve el nº de vídeos resumidos."""
-    _, videos = fetch_channel(normalize_channel_url(channel["url"]), CONFIG["check_latest_n"])
+    videos: list[dict] = []
+    for tab in channel_tabs(channel):
+        _, tab_videos = fetch_channel(normalize_channel_url(channel["url"], tab), CONFIG["check_latest_n"])
+        videos += [v for v in tab_videos if v["id"] not in {x["id"] for x in videos}]
     if not videos:
-        log.warning("No se encontraron vídeos en %s", channel["url"])
+        log.warning("No se encontraron vídeos en %s (%s)", channel["url"], "/".join(channel_tabs(channel)))
         return 0
-    log.info("[%s] %d vídeos recientes", channel["name"], len(videos))
+    log.info("[%s] %d vídeos recientes (%s)", channel["name"], len(videos), "/".join(channel_tabs(channel)))
 
     if channel["id"] not in state["initialized_channels"]:
         # Canal nuevo: marcamos como vistos todos menos los N más recientes para no reventar el chat
@@ -622,8 +657,9 @@ HELP_TEXT = """Envíame una o varias URLs de YouTube y te devuelvo un resumen. S
 
 Canales vigilados:
 /channels — lista los canales y si tienen prompt propio
-/add <url o @handle> — vigila un canal nuevo
+/add <url o @handle> — vigila un canal nuevo (si la URL acaba en /streams vigila los directos)
 /remove <canal> — deja de vigilarlo
+/tabs <canal> videos|streams|both — qué pestaña vigilar (vídeos normales, directos o ambas)
 
 Estilo de resumen:
 /prompt <canal> — muestra el prompt del canal
@@ -656,7 +692,7 @@ def format_channels(channels: dict) -> str:
     lines = ["Canales vigilados:"]
     for i, entry in enumerate(entries, 1):
         tag = "prompt propio" if entry.get("prompt") else "prompt por defecto"
-        lines.append(f"{i}. {entry['name']} ({entry.get('handle') or entry['id']}) — {tag}")
+        lines.append(f"{i}. {entry['name']} ({entry.get('handle') or entry['id']}) — {'+'.join(channel_tabs(entry))}, {tag}")
     lines.append("\nPrompt por defecto: " + ("personalizado" if channels.get("default_prompt") else "original"))
     return "\n".join(lines)
 
@@ -694,6 +730,18 @@ def handle_command(text: str) -> str:
         del channels["channels"][channel["id"]]
         save_channels(channels)
         return f"🗑 Ya no vigilo {channel['name']}."
+
+    if command == "/tabs":
+        ref, _, choice = arg.partition(" ")
+        channel = find_channel(channels, ref) if ref else None
+        if not channel:
+            return "No encuentro ese canal. Uso: /tabs <canal> videos|streams|both\n\n" + format_channels(channels)
+        choice = choice.strip().lower()
+        if choice not in ("videos", "streams", "both"):
+            return f"{channel['name']} vigila: {'+'.join(channel_tabs(channel))}. Uso: /tabs <canal> videos|streams|both"
+        channel["tabs"] = list(CHANNEL_TABS) if choice == "both" else [choice]
+        save_channels(channels)
+        return f"✅ {channel['name']} ahora vigila: {'+'.join(channel['tabs'])}"
 
     if command == "/prompt":
         ref, _, new_prompt = arg.partition(" ") if not arg.startswith('"') else (arg, "", "")
