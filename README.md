@@ -42,6 +42,9 @@ En modo bot, cualquier mensaje con URLs de YouTube que envíes al chat configura
 la URL con texto ("…/watch?v=xxx céntrate en lo que dice de NVIDIA"), ese texto se usa como
 instrucciones puntuales para ese resumen.
 
+`/video <url> [instrucciones]` hace lo mismo pero con un único vídeo: si la URL viene de una
+lista de reproducción (`&list=…`) o el mensaje trae más enlaces, solo se resume ese vídeo.
+
 ## Canales y estilos de resumen
 
 Los canales vigilados y su prompt viven en `channels.json` (ver

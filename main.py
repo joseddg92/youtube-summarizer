@@ -655,6 +655,8 @@ def seed_channels_from_env() -> None:
 
 HELP_TEXT = """Envíame una o varias URLs de YouTube y te devuelvo un resumen. Si añades texto junto a la URL, lo uso como instrucciones para ese resumen.
 
+/video <url> [instrucciones] — resume solo ese vídeo (ignora listas de reproducción y otras URLs del mensaje)
+
 Canales vigilados:
 /channels — lista los canales y si tienen prompt propio
 /add <url o @handle> — vigila un canal nuevo (si la URL acaba en /streams vigila los directos)
@@ -780,7 +782,33 @@ def handle_command(text: str) -> str:
     return f"Comando desconocido: {command}\n\n{HELP_TEXT}"
 
 
+def instructions_from_text(text: str) -> str | None:
+    """El texto que acompaña a las URLs son instrucciones puntuales para el resumen."""
+    # Quitamos la URL completa, incluidos parámetros como &t=120s o &list=... que van tras el ID
+    extra = re.sub(YOUTUBE_URL_RE.pattern + r"\S*", "", text)
+    return re.sub(r"[ \t]+", " ", extra).strip() or None
+
+
+def summarize_requested(chat_id: int, ids: list[str], extra: str | None) -> None:
+    for vid in ids:
+        try:
+            process_video({"id": vid, "title": vid, "url": video_url(vid)}, chat_id, eager=True, extra_instructions=extra)
+        except Exception as exc:  # noqa: BLE001
+            log_error(f"Error procesando {vid} pedido por Telegram", exc)
+
+
 def handle_message(chat_id: int, text: str) -> None:
+    parts = text.strip().split(maxsplit=1) if text.startswith("/") else [""]
+    command = parts[0].lower().split("@")[0]  # "/video@MiBot" -> "/video"
+    arg = parts[1] if len(parts) > 1 else ""
+    if command == "/video":
+        ids = extract_video_ids(arg)
+        if not ids:
+            send_message(chat_id, "Uso: /video <url de YouTube> [instrucciones opcionales]", preview=False)
+            return
+        summarize_requested(chat_id, ids[:1], instructions_from_text(arg))
+        return
+
     if text.startswith("/"):
         send_message(chat_id, handle_command(text), preview=False)
         return
@@ -789,16 +817,7 @@ def handle_message(chat_id: int, text: str) -> None:
     if not ids:
         send_message(chat_id, "No veo ninguna URL de YouTube en el mensaje.\n\n" + HELP_TEXT, preview=False)
         return
-
-    # El texto que acompaña a las URLs son instrucciones puntuales para este resumen
-    extra = YOUTUBE_URL_RE.sub("", text)
-    extra = re.sub(r"[ \t]+", " ", extra).strip() or None
-
-    for vid in ids:
-        try:
-            process_video({"id": vid, "title": vid, "url": video_url(vid)}, chat_id, eager=True, extra_instructions=extra)
-        except Exception as exc:  # noqa: BLE001
-            log_error(f"Error procesando {vid} pedido por Telegram", exc)
+    summarize_requested(chat_id, ids, instructions_from_text(text))
 
 
 def handle_telegram_updates() -> None:
