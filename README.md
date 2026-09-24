@@ -81,7 +81,7 @@ Ejemplo de cron (cada 30 min):
 ## Cómo funciona
 
 1. `yt-dlp` lista los últimos `CHECK_LATEST_N` vídeos de la pestaña *Videos* del canal (sin descargar nada).
-2. Para cada vídeo no visto, obtiene los subtítulos en formato `json3` y los convierte a texto plano. Prioridad: manuales en `SUBTITLE_LANGUAGES` > automáticos en el idioma original del vídeo (`xx-orig`, mejor que las traducciones automáticas) > automáticos en `SUBTITLE_LANGUAGES`. Si el vídeo está en directo o aún no tiene subtítulos (los directos recién terminados tardan horas en tenerlos), se reintenta en cada pasada hasta `GIVE_UP_AFTER_HOURS`.
+2. Para cada vídeo no visto, obtiene los subtítulos en formato `json3` y los convierte a texto plano. Prioridad: manuales > automáticos del audio original (`xx-orig` del idioma original) > traducciones automáticas. YouTube dobla muchos vídeos con voces de IA y cada doblaje trae su propio `xx-orig`; se descartan detectando cuál es la pista de audio original. Si el vídeo está en directo o aún no tiene subtítulos (los directos recién terminados tardan horas en tenerlos), se reintenta en cada pasada hasta `GIVE_UP_AFTER_HOURS`.
 3. Envía la transcripción a `POST {HETZNER_INFERENCE_BASE_URL}/chat/completions` con el SDK de OpenAI (con `enable_thinking: false`; si no, Qwen gasta todos los tokens razonando y devuelve una respuesta vacía).
 4. Manda `🎬 título + enlace + resumen` por Telegram (troceado si supera 4096 caracteres). Mientras trabaja, edita un mensaje con el progreso ("Obteniendo subtítulos…", "Resumiendo…").
 

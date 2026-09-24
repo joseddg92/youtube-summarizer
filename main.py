@@ -281,32 +281,62 @@ def parse_json3(raw: bytes) -> str:
     return " ".join(lines)
 
 
+def lang_base(code: str) -> str:
+    """'en-US-orig' -> 'en', 'es' -> 'es'."""
+    return code.removesuffix("-orig").split("-")[0].lower()
+
+
+def original_language(info: dict) -> str | None:
+    """
+    Idioma del audio original del vídeo. Hace falta porque YouTube dobla automáticamente muchos
+    vídeos con voces de IA, y cada pista doblada trae sus propios subtítulos "xx-orig".
+    """
+    for fmt in info.get("formats") or []:
+        note = fmt.get("format_note") or ""
+        if fmt.get("language") and ((fmt.get("language_preference") or 0) >= 10 or "original" in note):
+            return fmt["language"]
+    return info.get("language")
+
+
 def fetch_transcript(url: str, langs: list[str]) -> tuple[dict, str | None, str]:
     """
     Extrae info del vídeo y su transcripción.
     Devuelve (info, texto|None, descripción de la fuente).
-    Prioridad: subtítulos manuales > automáticos, en el orden de `langs`.
     """
     with yt_dlp.YoutubeDL(ydl_base_opts()) as ydl:
         info = with_retries("Info del vídeo", lambda: ydl.extract_info(url, download=False))
         # "live_chat" aparece como subtítulo manual en los directos, pero es la repetición del chat
         manual = {k: v for k, v in (info.get("subtitles") or {}).items() if k != "live_chat"}
         auto = info.get("automatic_captions") or {}
-        # Orden de preferencia: manuales en nuestros idiomas > automáticos en el idioma ORIGINAL
-        # del vídeo (clave "xx-orig"; las demás son traducciones automáticas, peores) > automáticos
-        # en nuestros idiomas > cualquier manual.
-        candidates: list[tuple[str, str, list]] = []
-        for lang in langs:
-            candidates += [("manual", k, f) for k, f in manual.items() if k == lang or k.startswith(lang + "-")]
-        candidates += [("auto", k, f) for k, f in auto.items() if k.endswith("-orig")]
-        for lang in langs:
-            candidates += [("auto", k, f) for k, f in auto.items() if k == lang or k.startswith(lang + "-")]
-        candidates += [("manual", k, f) for k, f in manual.items()]
+        orig = original_language(info)
+        orig_base = lang_base(orig) if orig else None
+        orig_tracks = [k for k in auto if k.endswith("-orig")]
+        # Los "xx-orig" de otros idiomas son el reconocimiento de voz de los doblajes de IA
+        # (transcripción de una traducción automática): nunca los usamos.
+        if orig_base:
+            asr_tracks = [k for k in orig_tracks if lang_base(k) == orig_base]
+        else:
+            asr_tracks = orig_tracks if len(orig_tracks) == 1 else []
+
+        def matching(table: dict, lang: str) -> list[str]:
+            return [k for k in table if not k.endswith("-orig") and lang_base(k) == lang_base(lang)]
+
+        # Preferencia: manuales en el idioma original > manuales en nuestros idiomas >
+        # automáticos del audio original > traducciones automáticas de ese audio > cualquier manual
+        candidates: list[tuple[str, str]] = []
+        for lang in ([orig_base] if orig_base else []) + langs:
+            candidates += [("manual", k) for k in matching(manual, lang)]
+        candidates += [("auto", k) for k in asr_tracks]
+        for lang in ([orig_base] if orig_base else []) + langs:
+            candidates += [("auto", k) for k in matching(auto, lang)]
+        candidates += [("manual", k) for k in manual]
+
         seen: set[tuple[str, str]] = set()
-        for kind, key, formats in candidates:
+        for kind, key in candidates:
             if (kind, key) in seen:
                 continue
             seen.add((kind, key))
+            formats = (manual if kind == "manual" else auto)[key]
             fmt = next((f for f in formats if f.get("ext") == "json3" and f.get("url")), None)
             if not fmt:
                 continue
