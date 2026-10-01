@@ -1,10 +1,12 @@
 # youtube-summaricer
 
-Vigila uno o varios canales de YouTube, descarga los subtítulos de cada vídeo nuevo con
-**yt-dlp**, los resume con la **Inference API de Hetzner** (compatible con OpenAI) y te manda
-el resumen + enlace por **Telegram**. También puedes enviarle al bot cualquier URL de YouTube
-y te la resume al momento, editando un mensaje de progreso mientras trabaja. Cada canal puede
-tener su propio estilo de resumen (por ejemplo, "enfocado a un trader"), gestionable desde Telegram.
+Bot de Telegram que resume vídeos de YouTube. Descarga los subtítulos con **yt-dlp**, los resume
+con un LLM compatible con OpenAI (por defecto la **Inference API de Hetzner**) y envía el resumen
++ enlace por **Telegram**.
+
+Lo puede usar **cualquier usuario, grupo o canal**: cada chat tiene sus propias suscripciones a
+canales de YouTube, cada una con su propio estilo de resumen (prompt). Todas las acciones se
+notifican al chat de administración (`TELEGRAM_CHAT_ID`).
 
 ## Instalación
 
@@ -20,69 +22,59 @@ cp .env.example .env   # y rellena las claves
 |---|---|
 | `HETZNER_INFERENCE_API_KEY` | Token creado en https://experiments.hetzner.com/ |
 | `HETZNER_INFERENCE_MODEL` | `Qwen/Qwen3.6-35B-A3B-FP8` (por defecto) o `Qwen3.8-27B` |
-| `YOUTUBE_CHANNEL_ID` | Canal inicial (URL, `@handle` o ID `UC…`). Solo se usa para crear `channels.json` la primera vez |
 | `TELEGRAM_BOT_API_KEY` | Token que te da [@BotFather](https://t.me/BotFather) |
-| `TELEGRAM_CHAT_ID` | Chat destino. Escribe algo a tu bot y ejecuta `python main.py --get-chat-id` |
-| `YTDLP_COOKIES_FROM_BROWSER` | Opcional. Solo si YouTube devuelve *"Sign in to confirm you're not a bot"* (pasa tras muchas peticiones seguidas o desde IPs de datacenter): navegador del que leer cookies (`firefox`, `chrome`, `safari`, `brave`…) |
-| `SUBTITLE_LANGUAGES` | Idiomas de subtítulos a intentar, en orden (`en,es`) |
+| `TELEGRAM_CHAT_ID` | Chat de administración, donde se notifica todo lo que hace cualquiera con el bot. Puede ser un chat privado, un grupo o un canal (el bot debe ser admin). Para obtener el id: `python main.py --get-chat-id` |
+| `YTDLP_COOKIES_FROM_BROWSER` | Opcional. Solo si YouTube devuelve *"Sign in to confirm you're not a bot"*: navegador del que leer cookies (`firefox`, `chrome`, `safari`, `brave`…) |
+| `SUBTITLE_LANGUAGES` | Idiomas de subtítulos a intentar si no hay del idioma original (`en,es`) |
 | `SUMMARY_LANGUAGE` | Idioma del resumen (`español`) |
+| `WORKERS` | Resúmenes en paralelo (3) |
 
 El resto de variables están comentadas en [.env.example](.env.example).
 
 ## Uso
 
 ```bash
-python main.py                   # modo bot: escucha Telegram + comprueba el canal cada POLL_INTERVAL_MINUTES
-python main.py --once            # una pasada por el canal y sale (para cron / launchd; no escucha Telegram)
-python main.py --video <URL>     # prueba con un vídeo concreto
+python main.py                   # bot: escucha Telegram y comprueba los canales cada POLL_INTERVAL_MINUTES
+python main.py --once            # una pasada por los canales suscritos y sale (cron; no escucha Telegram)
+python main.py --video <URL>     # resume un vídeo y lo envía al chat de administración
 ```
 
-En modo bot, cualquier mensaje con URLs de YouTube que envíes al chat configurado
-(`TELEGRAM_CHAT_ID`) se resume al instante; mensajes de otros chats se ignoran. Si acompañas
-la URL con texto ("…/watch?v=xxx céntrate en lo que dice de NVIDIA"), ese texto se usa como
-instrucciones puntuales para ese resumen.
+Al arrancar, el bot registra sus comandos en Telegram para que aparezcan en el menú `/`.
 
-`/video <url> [instrucciones]` hace lo mismo pero con un único vídeo: si la URL viene de una
-lista de reproducción (`&list=…`) o el mensaje trae más enlaces, solo se resume ese vídeo.
-
-## Canales y estilos de resumen
-
-Los canales vigilados y su prompt viven en `channels.json` (ver
-[channels.example.json](channels.example.json)). Se gestionan desde Telegram:
+## Comandos
 
 | Comando | Qué hace |
 |---|---|
-| `/channels` | Lista los canales y si tienen prompt propio |
-| `/add <url o @handle>` | Vigila un canal nuevo. Si la URL acaba en `/streams`, vigila los directos en vez de los vídeos |
-| `/remove <canal>` | Deja de vigilarlo |
-| `/tabs <canal> videos\|streams\|both` | Qué pestaña del canal vigilar (vídeos normales, directos o ambas) |
-| `/prompt <canal>` | Muestra el prompt del canal |
-| `/prompt <canal> <texto>` | Fija el prompt del canal (el texto puede ir en la línea siguiente) |
-| `/prompt <canal> reset` | Vuelve al prompt por defecto |
-| `/default [texto \| reset]` | Muestra / cambia / restaura el prompt por defecto |
+| `/ayuda`, `/start`, `/help` | Lista de comandos |
+| `/video <url>` | Resume ese vídeo. Pregunta cómo resumirlo (texto libre) con botón **Usar prompt por defecto**. Si escribes las instrucciones tras la URL, se salta la pregunta |
+| `/suscribirse <url>` | Suscribe el chat a un canal de YouTube. Pregunta el prompt (con botón por defecto) y después ofrece **Resumir los últimos 3** vídeos como ejemplo u **Omitir**; si no se contesta en 30 min, la pregunta se borra y se omite. Con una URL acabada en `/streams` sigue los directos. También acepta la URL de un vídeo del canal |
+| `/suscripciones` | Lista las suscripciones del chat con botones para **editar el prompt** o **borrarlas** |
 
-`<canal>` puede ser el número que sale en `/channels`, el `@handle` o parte del nombre.
+Detalles:
 
-El prompt de un canal se aplica tanto a los vídeos nuevos detectados como a cualquier URL suya
-que envíes a mano (se identifica por el `channel_id` del vídeo). Los vídeos resumidos a mano
-(`--video` o URL por Telegram) se marcan como procesados para que el vigilante no los repita. El prompt describe solo el
-enfoque y la estructura; el idioma, el formato de texto plano y la fidelidad al contenido se
-imponen siempre.
+- **Prompt por defecto** en `/video`: si el chat está suscrito al canal del vídeo, se usa el prompt de esa suscripción; si no, el genérico.
+- En **privado** basta con escribir el prompt; pegar una URL suelta equivale a `/video`.
+- En **grupos** hay que *responder* al mensaje del bot (con el modo privacidad, Telegram no le entrega el resto de mensajes), y solo quien lanzó el comando puede contestar o pulsar los botones.
+- En **canales** el bot debe ser administrador; el siguiente post es el prompt, y solo los administradores pueden pulsar los botones (los suscriptores del canal también los ven).
+- Si lanzas un comando nuevo con una pregunta pendiente, la anterior se cancela. Las preguntas de prompt caducan a las 24 h.
+- Si expulsan o bloquean al bot, se borran las suscripciones de ese chat.
 
-En la primera ejecución solo se resumen los `FIRST_RUN_VIDEOS` vídeos más recientes; el
-resto se marcan como vistos en `state.json` para no inundar el chat.
+## Datos
 
-Ejemplo de cron (cada 30 min):
+- `subscriptions.json`: suscripciones por chat (ver [subscriptions.example.json](subscriptions.example.json)).
+- `state.json`: vídeos ya vistos/pendientes, a qué chats se ha enviado cada vídeo y preguntas abiertas.
 
-```
-*/30 * * * * cd /ruta/youtube-summaricer && .venv/bin/python main.py --once >> summarizer.log 2>&1
-```
+Si existe un `channels.json` de la versión anterior (un solo usuario) y no hay `subscriptions.json`,
+se migra automáticamente al chat `TELEGRAM_CHAT_ID`.
 
 ## Cómo funciona
 
-1. `yt-dlp` lista los últimos `CHECK_LATEST_N` vídeos de la pestaña *Videos* del canal (sin descargar nada).
-2. Para cada vídeo no visto, obtiene los subtítulos en formato `json3` y los convierte a texto plano. Prioridad: manuales > automáticos del audio original (`xx-orig` del idioma original) > traducciones automáticas. YouTube dobla muchos vídeos con voces de IA y cada doblaje trae su propio `xx-orig`; se descartan detectando cuál es la pista de audio original. Si el vídeo está en directo o aún no tiene subtítulos (los directos recién terminados tardan horas en tenerlos), se reintenta en cada pasada hasta `GIVE_UP_AFTER_HOURS`.
-3. Envía la transcripción a `POST {HETZNER_INFERENCE_BASE_URL}/chat/completions` con el SDK de OpenAI (con `enable_thinking: false`; si no, Qwen gasta todos los tokens razonando y devuelve una respuesta vacía).
-4. Manda `🎬 título + enlace + resumen` por Telegram (troceado si supera 4096 caracteres). Mientras trabaja, edita un mensaje con el progreso ("Obteniendo subtítulos…", "Resumiendo…").
+1. Cada `POLL_INTERVAL_MINUTES`, `yt-dlp` lista los últimos `CHECK_LATEST_N` vídeos de cada canal con al menos un suscriptor (pestaña *Videos* y/o *Directos*).
+2. Para cada vídeo no visto, obtiene los subtítulos en formato `json3` y los convierte a texto plano. Prioridad: manuales > automáticos del audio original (`xx-orig` del idioma original) > traducciones automáticas. YouTube dobla muchos vídeos con voces de IA y cada doblaje trae su propio `xx-orig`; se descartan detectando cuál es la pista de audio original. Si el vídeo está en directo o aún no tiene subtítulos (los directos tardan horas en tenerlos), se reintenta en cada pasada hasta `GIVE_UP_AFTER_HOURS`.
+3. La transcripción se descarga una vez y se resume para cada suscriptor con su prompt (una sola llamada al LLM por prompt distinto), con el SDK de OpenAI (`enable_thinking: false`; si no, Qwen gasta todos los tokens razonando y devuelve una respuesta vacía).
+4. Se envía `🎬 título + enlace + resumen` (troceado si supera 4096 caracteres). En las peticiones manuales, el mensaje se va editando con el progreso.
+5. Los resúmenes se hacen en un pool de `WORKERS` hilos, así el bot sigue respondiendo mientras trabaja.
 
-Límites de la API de Hetzner (por token): 10 peticiones/min, 4M tokens de entrada/min. `MAX_VIDEOS_PER_RUN` evita superarlos.
+Al suscribirse a un canal que nadie seguía, lo ya publicado se marca como visto (para eso están los
+ejemplos). Límites de la API de Hetzner (por token): 10 peticiones/min, 4M tokens de entrada/min;
+`MAX_VIDEOS_PER_RUN` y `WORKERS` evitan superarlos.

@@ -5,3 +5,5 @@ cookies.txt
 __pycache__/
 *.pyc
 channels.json
+subscriptions.json
+venv/
